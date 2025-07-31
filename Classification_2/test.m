@@ -20,8 +20,9 @@ processing_options.filter_low_peaks = true;
 processing_options.peak_zscore_threshold = 1;  % Remove events with peak z-score < -1.5
 processing_options.filter_close_events = true;
 processing_options.interval_method = 'peak_to_peak';
-processing_options.interval_zscore = 1.7;         % Remove events with interval z-score < -1.0
+processing_options.interval_zscore = 1;         % Remove events with interval z-score < -1.0
 processing_options.verbose = true;
+processing_options.plot_intermediate = false;      % NEW: Enable intermediate plotting
 
 [final_events, final_features, stats] = processEMGEvents(L_MASS_envelope, confirmed_events, FsEMG, processing_options);
 

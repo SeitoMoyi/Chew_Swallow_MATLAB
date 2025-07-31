@@ -1,32 +1,4 @@
 function [final_events, final_features, processing_stats] = processEMGEvents(emg_envelope, detected_events, Fs, options)
-    % processEMGEvents: Unified function for feature extraction and z-score filtering
-    %
-    % Inputs:
-    %   emg_envelope    - (1xN double) The processed EMG envelope signal
-    %   detected_events - (Mx2 double) Matrix of event start and end indices
-    %   Fs              - (double) Sampling frequency in Hz
-    %   options         - (struct) Processing options:
-    %       .filter_low_peaks      - (logical) Enable peak amplitude filtering (default: true)
-    %       .peak_zscore_threshold - (double) Z-score threshold for peaks (default: 1.5)
-    %       .filter_close_events   - (logical) Enable interval filtering (default: true)
-    %       .interval_method       - (string) 'peak_to_peak', 'end_to_start' (default: 'peak_to_peak')
-    %       .interval_zscore       - (double) Z-score threshold for intervals (default: 1.5)
-    %       .verbose               - (logical) Show detailed output (default: true)
-    %
-    % Outputs:
-    %   final_events      - (Nx2 double) Filtered events matrix
-    %   final_features    - (Nx9 double) Extended features matrix:
-    %                       Col 1: Peak Amplitude (V)
-    %                       Col 2: Duration (s)
-    %                       Col 3: Integrated EMG (V*s)
-    %                       Col 4: Mean Amplitude (V)
-    %                       Col 5: RMS (V)
-    %                       Col 6: Peak Index (sample)
-    %                       Col 7: Interval to Next Event (s)
-    %                       Col 8: Peak Z-Score
-    %                       Col 9: Interval Z-Score
-    %   processing_stats  - (struct) Processing statistics
-    
     % Set default options
     if nargin < 4; options = struct(); end
     if ~isfield(options, 'filter_low_peaks');      options.filter_low_peaks = true; end
@@ -35,6 +7,7 @@ function [final_events, final_features, processing_stats] = processEMGEvents(emg
     if ~isfield(options, 'interval_method');       options.interval_method = 'peak_to_peak'; end
     if ~isfield(options, 'interval_zscore');       options.interval_zscore = 1.5; end
     if ~isfield(options, 'verbose');               options.verbose = true; end
+    if ~isfield(options, 'plot_intermediate');     options.plot_intermediate = false; end
     
     % Initialize stats
     processing_stats = struct();
@@ -89,24 +62,8 @@ function [final_events, final_features, processing_stats] = processEMGEvents(emg
         all_features(1:end-1, 7) = intervals / Fs; % Store in seconds for user reference
     end
     
-    % Calculate z-scores
+    % Calculate z-scores for peaks only
     all_features(:, 8) = zscore(all_features(:, 1)); % Peak amplitude z-scores
-    if num_events > 2
-        % Use raw intervals (samples) for z-score calculation - more efficient
-        switch lower(options.interval_method)
-            case 'peak_to_peak'
-                raw_intervals = diff(all_features(:, 6));
-            case 'end_to_start'
-                raw_intervals = detected_events(2:end, 1) - detected_events(1:end-1, 2);
-            case 'start_to_start'
-                raw_intervals = diff(detected_events(:, 1));
-        end
-        
-        if length(raw_intervals) > 1
-            interval_zscores = zscore(raw_intervals);
-            all_features(1:length(interval_zscores), 9) = interval_zscores;
-        end
-    end
     
     % === STEP 2: Filter by Peak Z-Score ===
     keep_indices = true(num_events, 1);
@@ -121,6 +78,43 @@ function [final_events, final_features, processing_stats] = processEMGEvents(emg
         
         if options.verbose
             fprintf('  Removed %d events with peak z-score < %.1f\n', sum(~peak_keep), -options.peak_zscore_threshold);
+        end
+        
+        % === NEW: Plot intermediate results after peak filtering ===
+        if options.plot_intermediate
+            plotIntermediateResults(emg_envelope, detected_events, keep_indices, Fs, ...
+                'After Peak Filtering', processing_stats.after_peak_filter);
+        end
+        
+        % === NEW: Recalculate intervals and interval z-scores after peak filtering ===
+        if sum(keep_indices) > 1
+            % Extract the events that passed peak filtering
+            filtered_events = detected_events(keep_indices, :);
+            filtered_features = all_features(keep_indices, :);
+            
+            % Recalculate intervals based on the filtered events
+            num_filtered_events = size(filtered_events, 1);
+            switch lower(options.interval_method)
+                case 'peak_to_peak'
+                    raw_intervals = diff(filtered_features(:, 6)); % Peak-to-peak in samples
+                case 'end_to_start'
+                    raw_intervals = filtered_events(2:end, 1) - filtered_events(1:end-1, 2); % Gap in samples
+                case 'start_to_start'
+                    raw_intervals = diff(filtered_events(:, 1)); % Start-to-start in samples
+            end
+            
+            % Update the interval column in all_features (only for the kept events)
+            all_features(keep_indices, 7) = [raw_intervals / Fs; NaN]; % Store in seconds, last event has no interval
+            
+            % Recalculate interval z-scores
+            if num_filtered_events > 2
+                interval_zscores = zscore(raw_intervals);
+                % Update the interval z-score column in all_features (only for the kept events that have an interval)
+                % Note: The last event doesn't have an interval, so we don't update its z-score
+                kept_indices_with_interval = find(keep_indices);
+                kept_indices_with_interval = kept_indices_with_interval(1:end-1); % Exclude last event
+                all_features(kept_indices_with_interval, 9) = interval_zscores;
+            end
         end
     else
         processing_stats.after_peak_filter = processing_stats.original_count;
@@ -193,4 +187,50 @@ function [final_events, final_features, processing_stats] = processEMGEvents(emg
             end
         end
     end
+end
+
+function plotIntermediateResults(emg_envelope, detected_events, keep_indices, Fs, title_str, event_count)
+    % Plot intermediate results after peak filtering
+    % Create time vector
+    t = (0:length(emg_envelope)-1)/Fs;
+    
+    % Create new figure
+    figure('Position', [100, 100, 1200, 400]);
+    hold on;
+    
+    % Plot EMG envelope
+    plot(t, emg_envelope, 'b', 'DisplayName', 'EMG Envelope', 'LineWidth', 0.5);
+    
+    % Plot events with different colors for kept/removed events
+    for k = 1:size(detected_events, 1)
+        start_idx = detected_events(k, 1);
+        end_idx = detected_events(k, 2);
+        
+        if keep_indices(k)
+            % Kept events - green
+            event_color = 'green';
+            display_name = '';
+            if k == find(keep_indices, 1)
+                display_name = 'Kept Events';
+            end
+        else
+            % Removed events - red
+            event_color = 'red';
+            display_name = '';
+            if k == find(~keep_indices, 1)
+                display_name = 'Removed Events';
+            end
+        end
+        
+        plot(t(start_idx:end_idx), emg_envelope(start_idx:end_idx), ...
+             'Color', event_color, 'LineWidth', 1.5, 'DisplayName', display_name);
+    end
+    
+    % Formatting
+    title(sprintf('%s (%d events)', title_str, event_count));
+    xlabel('Time (s)');
+    ylabel('Amplitude (V)');
+    grid on;
+    legend('Location', 'best');
+    hold off;
 end
