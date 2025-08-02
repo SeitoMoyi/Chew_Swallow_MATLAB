@@ -1,0 +1,393 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delsys EMG Recorder</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 10px;
+            background-color: #f5f5f5;
+            overflow-x: hidden;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 15px;
+        }
+
+        #recordButton {
+            padding: 15px 30px;
+            font-size: 20px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            margin-bottom: 10px;
+        }
+
+        #recordButton.recording {
+            background-color: #f44336;
+        }
+
+        #recordButton:hover:not(.recording) {
+            background-color: #45a049;
+        }
+
+        #recordButton:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+
+        #status {
+            text-align: center;
+            font-size: 16px;
+            min-height: 1.5em;
+            margin-bottom: 10px;
+        }
+
+        .error {
+            color: #d32f2f;
+        }
+
+        .success {
+            color: #388e3c;
+        }
+
+        .info {
+            color: #1976d2;
+        }
+
+        /* --- Y-Axis Control --- */
+        .y-axis-control {
+            text-align: center;
+            margin-bottom: 15px;
+            padding: 5px;
+            background-color: #e0e0e0;
+            border-radius: 5px;
+        }
+
+        #yAxisSlider {
+            width: 80%;
+            max-width: 600px;
+        }
+
+        #yAxisValue {
+            display: inline-block;
+            width: 80px;
+            text-align: right;
+            font-weight: bold;
+        }
+
+        .charts-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+        }
+
+        .chart-wrapper {
+            background-color: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            padding: 10px;
+            height: 200px;
+        }
+
+        .chart-container {
+            width: 100%;
+            height: calc(100% - 20px);
+        }
+
+        .chart-title {
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 5px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1>EMG Recorder</h1>
+        <button id="recordButton">Hold to Record</button>
+        <div id="status">Ready</div>
+
+        <!-- Y-Axis Control Slider -->
+        <div class="y-axis-control">
+            <label for="yAxisSlider">Chart Y-Max: <span id="yAxisValue">0.050</span> V</label><br>
+            <input type="range" id="yAxisSlider" min="0.001" max="0.2" step="0.001" value="0.05">
+        </div>
+    </div>
+
+    <div class="charts-container" id="chartsContainer">
+        <!-- Charts will be dynamically inserted here -->
+    </div>
+
+    <script>
+        const NUM_SENSORS = {{ num_sensors }};
+        const MUSCLE_LABELS = {{ muscle_labels | tojson }};
+        const LIVE_DATA_INTERVAL = 100;
+        const SAMPLES_PER_CHUNK = 75;
+        const MAX_POINTS_PER_CHART = 500;
+
+        const recordButton = document.getElementById('recordButton');
+        const statusDiv = document.getElementById('status');
+        const yAxisSlider = document.getElementById('yAxisSlider');
+        const yAxisValue = document.getElementById('yAxisValue');
+        let isRequestPending = false;
+        let isCurrentlyRecording = false;
+        let charts = [];
+        let liveDataIntervalId = null;
+
+        // --- Initialize Charts ---
+        function initializeCharts() {
+            const container = document.getElementById('chartsContainer');
+            container.innerHTML = '';
+            charts = [];
+
+            for (let i = 0; i < NUM_SENSORS; i++) {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'chart-wrapper';
+
+                const titleDiv = document.createElement('div');
+                titleDiv.className = 'chart-title';
+                titleDiv.id = `chart-title-${i}`;
+                titleDiv.textContent = MUSCLE_LABELS[i] || `Channel ${i}`;
+                wrapper.appendChild(titleDiv);
+
+                const chartDiv = document.createElement('div');
+                chartDiv.className = 'chart-container';
+                const canvas = document.createElement('canvas');
+                canvas.id = `chart-${i}`;
+                chartDiv.appendChild(canvas);
+                wrapper.appendChild(chartDiv);
+
+                container.appendChild(wrapper);
+
+                const ctx = canvas.getContext('2d');
+                const chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            label: 'EMG Amplitude',
+                            data: [],
+                            borderColor: 'rgb(75, 192, 192)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.1)',
+                            borderWidth: 1,
+                            pointRadius: 0,
+                            fill: true
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        scales: {
+                            x: {
+                                display: false,
+                                type: 'linear',
+                                min: 0,
+                            },
+                            y: {
+                                beginAtZero: true,
+                                suggestedMax: parseFloat(yAxisSlider.value), // Initial value from slider
+                                suggestedMin: 0
+                            }
+                        },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: { enabled: false }
+                        }
+                    }
+                });
+                charts.push(chart);
+            }
+        }
+
+        // --- Update Charts with Live Data (FIXED) ---
+        async function updateCharts() {
+            if (!isCurrentlyRecording) return;
+
+            try {
+                const response = await fetch('/live_data');
+                const data = await response.json();
+                const liveDataChunks = data.data;
+                const labels = data.labels;
+
+                if (!liveDataChunks || liveDataChunks.length !== NUM_SENSORS) {
+                    console.warn("Received unexpected live data format.");
+                    return;
+                }
+
+                for (let ch = 0; ch < NUM_SENSORS; ch++) {
+                    const chart = charts[ch];
+                    const channelData = liveDataChunks[ch];
+                    const label = labels[ch];
+
+                    const titleElement = document.getElementById(`chart-title-${ch}`);
+                    if (titleElement && titleElement.textContent !== label) {
+                        titleElement.textContent = label;
+                    }
+
+                    if (channelData && channelData.length > 0) {
+                        let startIndex = Math.max(0, channelData.length - MAX_POINTS_PER_CHART);
+                        let endIndex = channelData.length;
+                        let displayData = channelData.slice(startIndex, endIndex);
+
+                        // FIX: Always start x-axis from 0
+                        let xLabels = [];
+                        for (let i = 0; i < displayData.length; i++) {
+                            xLabels.push(i);  // Start from 0, not startIndex
+                        }
+
+                        chart.data.labels = xLabels;
+                        chart.data.datasets[0].data = displayData;
+                        chart.options.scales.x.max = Math.max(1, displayData.length - 1);  // Use displayData.length
+                        chart.update();
+                    }
+                }
+            } catch (error) {
+                console.error("Error fetching or updating live charts:", error);
+            }
+        }
+
+        // --- Start/Stop Live Updates ---
+        function startLiveUpdates() {
+            if (liveDataIntervalId) {
+                clearInterval(liveDataIntervalId);
+            }
+            liveDataIntervalId = setInterval(updateCharts, LIVE_DATA_INTERVAL);
+            console.log("Live chart updates started.");
+        }
+
+        function stopLiveUpdates() {
+            if (liveDataIntervalId) {
+                clearInterval(liveDataIntervalId);
+                liveDataIntervalId = null;
+                console.log("Live chart updates stopped.");
+            }
+        }
+
+        // --- Recording Control ---
+        recordButton.addEventListener('mousedown', startRecording);
+        recordButton.addEventListener('touchstart', function (e) {
+            e.preventDefault();
+            startRecording();
+        });
+
+        window.addEventListener('mouseup', stopRecording);
+        window.addEventListener('touchend', stopRecording);
+
+        async function startRecording() {
+            if (isRequestPending || isCurrentlyRecording) return;
+            isRequestPending = true;
+            updateRecordButtonState(true, "Starting...");
+            updateStatus("Starting recording...", 'info');
+
+            try {
+                const response = await fetch('/start_recording', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (data.success) {
+                    isCurrentlyRecording = true;
+                    updateStatus(data.message, 'success');
+                    startLiveUpdates();
+                } else {
+                    updateStatus('Error: ' + data.message, 'error');
+                    updateRecordButtonState(false, "Hold to Record");
+                }
+            } catch (error) {
+                console.error('Start recording error:', error);
+                updateStatus('Error: Failed to connect to server.', 'error');
+                updateRecordButtonState(false, "Hold to Record");
+            } finally {
+                isRequestPending = false;
+            }
+        }
+
+        async function stopRecording() {
+            if (!isCurrentlyRecording || isRequestPending) return;
+            isRequestPending = true;
+            updateStatus("Stopping recording...", 'info');
+
+            try {
+                const response = await fetch('/stop_recording', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (data.success) {
+                    updateStatus(data.message, 'success');
+                } else {
+                    updateStatus('Warning: ' + data.message, 'error');
+                }
+            } catch (error) {
+                console.error('Stop recording error:', error);
+                updateStatus('Error: Failed to connect to server.', 'error');
+            } finally {
+                isCurrentlyRecording = false;
+                updateRecordButtonState(false, "Hold to Record");
+                stopLiveUpdates();
+                isRequestPending = false;
+            }
+        }
+
+        function updateRecordButtonState(isRecording, text) {
+            recordButton.textContent = text;
+            if (isRecording) {
+                recordButton.classList.add('recording');
+            } else {
+                recordButton.classList.remove('recording');
+            }
+        }
+
+        function updateStatus(message, typeClass = '') {
+            statusDiv.textContent = message;
+            statusDiv.className = typeClass;
+        }
+
+        // --- Y-Axis Slider Control ---
+        function updateYAxisMax() {
+            const newMax = parseFloat(yAxisSlider.value);
+            yAxisValue.textContent = newMax.toFixed(3); // Display with 3 decimal places
+
+            // Update the suggestedMax for all charts
+            for (let i = 0; i < charts.length; i++) {
+                const chart = charts[i];
+                if (chart && chart.options && chart.options.scales && chart.options.scales.y) {
+                    chart.options.scales.y.suggestedMax = newMax;
+                    // Optional: Update min based on new max for better scaling?
+                    // chart.options.scales.y.suggestedMin = -newMax / 10;
+                    chart.update(); // Redraw the chart with new scale
+                }
+            }
+        }
+
+        // Attach event listener to the slider
+        yAxisSlider.addEventListener('input', updateYAxisMax); // 'input' fires continuously as slider moves
+
+        // --- Initialize on Load ---
+        window.onload = function () {
+            initializeCharts();
+            updateStatus("System ready. Press and hold the button to start recording.", 'info');
+            // Set initial slider display value
+            yAxisValue.textContent = parseFloat(yAxisSlider.value).toFixed(3);
+        };
+    </script>
+</body>
+
+</html>
