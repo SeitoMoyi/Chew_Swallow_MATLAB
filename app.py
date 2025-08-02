@@ -1,23 +1,46 @@
 # app.py
 import os
-import json
 import numpy as np
 from flask import Flask, render_template, jsonify, request
-# Assuming the provided Delsys code is saved as 'delsys_handler.py'
 from delsys_handler import DelsysDataHandler
 import threading
 import time
 import scipy.io
 import collections
-import datetime # For timestamped filenames
+import datetime
+import queue  # Required for queue.Empty exception
+import tkinter as tk
+from tkinter import filedialog
+import sys
+
+def select_save_directory():
+    """Open a dialog to select the save directory before starting the app."""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    root.attributes('-topmost', True)  # Make the dialog topmost
+    
+    save_dir = filedialog.askdirectory(
+        title="Select directory to save EMG recordings",
+        initialdir="./recordings"  # Default directory
+    )
+    
+    root.destroy()
+    
+    if not save_dir:
+        print("No directory selected. Exiting.")
+        sys.exit(0)
+        
+    return save_dir
 
 app = Flask(__name__)
 
 # --- Configuration ---
-HOST_IP = 'localhost' # Replace with actual IP if needed
+HOST_IP = 'localhost'
 NUM_SENSORS = 16
 SAMPLING_RATE = 2000.0
-SAVE_DIRECTORY = "./recordings"
+
+# Let user select save directory before starting
+SAVE_DIRECTORY = select_save_directory()
 METADATA_DIRECTORY = os.path.join(SAVE_DIRECTORY, "metadata")
 STRUCTS_DIRECTORY = os.path.join(SAVE_DIRECTORY, "structs")
 os.makedirs(SAVE_DIRECTORY, exist_ok=True)
@@ -31,9 +54,9 @@ recording_lock = threading.Lock()
 is_recording = False
 start_time = None
 
-# --- Recording Session Info (for sequential naming) ---
-recording_session_start_time = None # datetime object for the session
-trial_counter = 1 # Counter for trials within a session
+# --- Recording Session Info ---
+recording_session_start_time = None
+trial_counter = 1
 
 # --- Live Data Buffering for GUI ---
 LIVE_BUFFER_CHUNKS = 10
@@ -42,14 +65,14 @@ live_data_lock = threading.Lock()
 
 # --- Helper Functions ---
 def generate_timestamps(num_samples):
-    """Generates timestamps based on start_time and sampling rate."""
+    """Generate timestamps based on start_time and sampling rate."""
     if start_time is None:
         return np.zeros(num_samples)
     timestamps = start_time + np.arange(num_samples) / SAMPLING_RATE
     return timestamps
 
 def recording_worker():
-    """Worker thread function to read data from the handler's queue while recording."""
+    """Worker thread to read data from the handler's queue while recording."""
     global is_recording, recording_data_buffer, start_time, live_data_buffers
     local_sample_count = 0
     print("Recording worker started.")
@@ -76,7 +99,7 @@ def recording_worker():
                             'label': muscle_label
                         })
 
-            except queue.Empty: # Note: This needs 'import queue' or use specific exception
+            except queue.Empty:
                  continue
             except Exception as e:
                  print(f"Error in recording worker loop: {e}")
@@ -113,7 +136,6 @@ def start_delsys_recording():
             if recording_session_start_time is None:
                 recording_session_start_time = datetime.datetime.now()
                 trial_counter = 1
-            # If a long time has passed, you might want to reset, but for now, we keep it
 
             handler = DelsysDataHandler(host_ip=HOST_IP, num_sensors=NUM_SENSORS, sampling_rate=SAMPLING_RATE)
 
@@ -197,10 +219,10 @@ def stop_delsys_recording():
         # --- Structured File Naming ---
         global recording_session_start_time, trial_counter
         if recording_session_start_time is None:
-             recording_session_start_time = datetime.datetime.now() # Fallback, though it should be set
+             recording_session_start_time = datetime.datetime.now()
 
         timestamp_str = recording_session_start_time.strftime("%Y%m%d_%H%M%S")
-        trial_str = f"{trial_counter:04d}" # Format as 0001, 0002, etc.
+        trial_str = f"{trial_counter:04d}"
 
         filename_base = f"{timestamp_str}_Trl{trial_str}"
         bin_filename = os.path.join(SAVE_DIRECTORY, f"{filename_base}.bin")
@@ -227,15 +249,14 @@ def stop_delsys_recording():
                 ]
             meta_data['session_date'] = recording_session_start_time.strftime("%Y-%m-%d")
             meta_data['session_time'] = recording_session_start_time.strftime("%H:%M:%S")
-            meta_data['trial_number'] = int(trial_counter) # Add trial number to metadata
+            meta_data['trial_number'] = int(trial_counter)
 
             scipy.io.savemat(meta_filename, {'meta_data': meta_data})
             print(f"Metadata saved to {meta_filename}")
         except Exception as e:
              print(f"Warning: Could not save metadata: {e}")
-             # Consider if this should fail the recording save
 
-        # Increment trial counter for the next recording in this session
+        # Increment trial counter for the next recording
         trial_counter += 1
 
         return True, f"Recording saved successfully ({min_samples} samples)."
@@ -252,12 +273,10 @@ def stop_delsys_recording():
             handler = None
         return False, f"Error stopping recording: {str(e)}"
 
-
 # --- Flask Routes ---
 @app.route('/')
 def index():
     labels = handler.muscle_labels if handler and hasattr(handler, 'muscle_labels') else [f'Ch{i}' for i in range(NUM_SENSORS)]
-    # Pass NUM_SENSORS to the template
     return render_template('index.html', num_sensors=NUM_SENSORS, muscle_labels=labels)
 
 @app.route('/start_recording', methods=['POST'])
@@ -282,10 +301,8 @@ def live_data():
             labels = []
             for i in range(NUM_SENSORS):
                 channel_chunks = []
-                channel_labels = set()
                 for chunk_dict in live_data_buffers[i]:
                     channel_chunks.extend(chunk_dict['samples'])
-                    channel_labels.add(chunk_dict['label'])
 
                 data_chunks.append(channel_chunks)
                 if live_data_buffers[i]:
@@ -295,18 +312,14 @@ def live_data():
 
         return jsonify({'data': data_chunks, 'labels': labels})
     except Exception as e:
-        print(f"Error fetching live  {e}")
+        print(f"Error fetching live data: {e}")
         return jsonify({'data': [[] for _ in range(NUM_SENSORS)], 'labels': [f'Ch{i}' for i in range(NUM_SENSORS)]})
-
-# Add missing import
-import queue # Add this import for queue.Empty
 
 if __name__ == '__main__':
     try:
         print("Starting Flask server...")
         print(f"Recordings will be saved to: {os.path.abspath(SAVE_DIRECTORY)}")
         handler = DelsysDataHandler(host_ip=HOST_IP, num_sensors=NUM_SENSORS, sampling_rate=SAMPLING_RATE)
-        # Initialize session time on startup (or it will be set on first record)
         recording_session_start_time = datetime.datetime.now()
         app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
     finally:
